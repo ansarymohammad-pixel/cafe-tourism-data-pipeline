@@ -1,0 +1,22 @@
+# Environnement Python
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.key
+
+# Données téléchargées et générées
+data/raw/
+data/processed/
+
+# Cache
+.cache/
+.pytest_cache/
+
+# Fichiers temporaires
+*.tmp
+.ipynb_checkpoints/

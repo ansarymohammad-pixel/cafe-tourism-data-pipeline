@@ -1,22 +1,54 @@
-# Environnement Python
+
+# Python virtual environments
 .venv/
+venv/
 __pycache__/
 *.pyc
+*.pyo
 
-# Secrets
+# Environment variables and secrets
 .env
 .env.*
 !.env.example
 *.key
+*.pem
 
-# Données téléchargées et générées
+# Downloaded and generated datasets
 data/raw/
 data/processed/
+data/interim/
 
-# Cache
+# Images and screenshots
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.svg
+*.bmp
+*.tiff
+
+# PDF documents
+*.pdf
+
+# Temporary and cache files
 .cache/
 .pytest_cache/
-
-# Fichiers temporaires
-*.tmp
 .ipynb_checkpoints/
+*.tmp
+*.log
+
+# Jupyter and Python tools
+.ruff_cache/
+.mypy_cache/
+
+# Operating systems and editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Build files
+dist/
+build/
+*.egg-info/

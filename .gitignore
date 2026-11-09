@@ -1,10 +1,14 @@
 
+# ==========================================
+# CAFÉ Tourism Data Pipeline
+# Git ignore configuration
+# ==========================================
+
 # Python virtual environments
 .venv/
 venv/
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 
 # Environment variables and secrets
 .env
@@ -13,10 +17,24 @@ __pycache__/
 *.key
 *.pem
 
+# Private notes and working journals
+journal/
+**/journal/
+
+# Word documents
+*.doc
+*.docx
+~$*
+
 # Downloaded and generated datasets
 data/raw/
 data/processed/
 data/interim/
+
+# Generated outputs and reports
+outputs/
+*.xlsx
+*.xls
 
 # Images and screenshots
 *.png

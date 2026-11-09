@@ -2,7 +2,7 @@
 from pathlib import Path
 import pandas as pd
 
-BASE = Path(__file__).resolve().parent
+BASE = Path(__file__).resolve().parents[2]
 
 fichier = (
     BASE / "data/processed/tourisme/nuites_2022.csv"

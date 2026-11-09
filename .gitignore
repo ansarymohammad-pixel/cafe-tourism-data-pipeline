@@ -70,3 +70,9 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+
+# Docker Compose - local configuration
+docker-compose.yml
+docker-compose.yaml
+compose.yml
+compose.yaml

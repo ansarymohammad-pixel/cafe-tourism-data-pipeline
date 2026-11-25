@@ -1,176 +1,229 @@
-"""CAFÉ — tourisme marchand 2022, livraison rapide COM/DEP/REG.
+"""CAFÉ - 51 : agrégation des nuitées marchandes 2022-2025.
 
-Estimation PROVISOIRE. Hôtels et autres : totaux nationaux annuels fournis
-(à confirmer dans la source INSEE). Camping : haute saison uniquement,
-JAMAIS convertie en total annuel. Mois sans données observées = vides.
-Répartition spatiale : capacité par type si colonne identifiable, sinon
-population 2023 (proxy dérivé du fichier non marchand). Ce n'est pas une
-observation communale. Géographie : celle du non marchand provisoire.
+Entrées : nuites_communales_estimees_{year}.csv (script 20)
+          nuites_{year}.csv (script 13, vérification indépendante)
+Sortie : tourisme_marchand_com_dep_reg_{year}.csv et contrôles.
+
+Hôtels et autres : année complète ; camping : HAUTE SAISON seulement.
+Les agrégations sont des estimations issues du script 20, pas des mesures
+communales observées. Les valeurs manquantes ne sont jamais remplacées par 0.
 """
 from pathlib import Path
+import argparse
 import re
 import pandas as pd
+import numpy as np
 
-ROOT = Path(__file__).resolve().parents[2]
-BASE = ROOT / 'data' / 'processed' / 'tourisme'
-OUT = BASE / 'livraison_cafe_2022'
-NON = OUT / 'TOURISME_NON_MARCHAND_2022_COM_DEP_REG_PROVISOIRE.csv'
-CAP = BASE / 'capacites_metro_2022.csv'
-FAMILY_TOTAL = 398_500_000
-HOTEL_TOTAL = 207_301_000  # valeur arrondie, à vérifier avec source nationale
-OTHER_TOTAL = 96_343_000  # valeur arrondie, à vérifier avec source nationale
-CAMPING_HIGH_SEASON = 135_708_000  # NON annuel, information documentaire seulement
-MONTHS = ('january','february','march','april','may','june','july',
-          'august','september','october','november','december')
+ROOT = Path(__file__).resolve().parents[3]
+PROCESSED = ROOT / "data" / "processed" / "tourisme"
+YEARS = (2022, 2023, 2024, 2025)
 
-def col(cols, names):
-    lookup = {str(c).strip().lower(): c for c in cols}
-    return next((lookup[n.lower()] for n in names if n.lower() in lookup), None)
+REGIONS = {
+    "11": "75 77 78 91 92 93 94 95",
+    "24": "18 28 36 37 41 45",
+    "27": "21 25 39 58 70 71 89 90",
+    "28": "14 27 50 61 76",
+    "32": "02 59 60 62 80",
+    "44": "08 10 51 52 54 55 57 67 68 88",
+    "52": "44 49 53 72 85",
+    "53": "22 29 35 56",
+    "75": "16 17 19 23 24 33 40 47 64 79 86 87",
+    "76": "09 11 12 30 31 32 34 46 48 65 66 81 82",
+    "84": "01 03 07 15 26 38 42 43 63 69 73 74",
+    "93": "04 05 06 13 83 84",
+    "94": "2A 2B",
+}
+DEP_TO_REG = {d: r for r, deps in REGIONS.items() for d in deps.split()}
+assert len(DEP_TO_REG) == 96
 
-def code(x):
-    if pd.isna(x): return None
-    s = str(x).strip().upper()
-    m = re.fullmatch(r'(?:\d{4}-COM-)?((?:\d{2}|2[AB])\d{3})', s)
-    return m.group(1) if m else None
+CATEGORIES = {
+    "hotels": ("nuites_hotels_estimees", "Hotels", "DEP"),
+    "campings": ("nuites_campings_estimees", "Campings", "DEP"),
+    "autres": ("nuites_autres_estimees", "Autres", "REG"),
+}
+MEASURES = [v[0] for v in CATEGORIES.values()]
 
-def find_weight_column(columns, kind):
-    """Only accept explicit capacity columns; never confuse nights with beds."""
-    patterns = {
-        'hotel': (r'(?:hotel|h[oô]tel)',),
-        'camping': (r'(?:camping|plein.air)',),
-        'other': (r'(?:autre|other|collectif|touris.*residen|residen.*touris)',),
-    }
-    candidates=[]
-    for c in columns:
-        s=str(c).lower()
-        if not any(re.search(p,s) for p in patterns[kind]): continue
-        if any(t in s for t in ('nuitee','nuitée','night','taux','rate','part','share','annee','year')): continue
-        if any(t in s for t in ('capac','lit','bed','place','chambre','room','emplacement','unit')):
-            candidates.append(c)
-    return candidates[0] if len(candidates)==1 else None
+
+def lire(path, required):
+    if not path.is_file():
+        raise FileNotFoundError(f"Source absente : {path}")
+    df = pd.read_csv(path, dtype=str, encoding="utf-8-sig", low_memory=False)
+    missing = set(required) - set(df.columns)
+    if missing:
+        raise ValueError(f"{path.name} : colonnes manquantes {sorted(missing)}")
+    return df
+
+
+def convertir(s):
+    return pd.to_numeric(
+        s.astype("string").str.replace(",", ".", regex=False),
+        errors="coerce",
+    )
+
+
+def code_geo(series, niveau):
+    # Codes INSEE comme 2026-DEP-75 / 2026-REG-84 ; géographie source
+    # pas nécessairement identique à l'année des nuitées.
+    return series.astype("string").str.extract(
+        rf"(?:^|-)({niveau})-([0-9]{{2}}|2A|2B)$", expand=True
+    )[1]
+
+
+def charger_communes(year):
+    path = PROCESSED / str(year) / f"nuites_communales_estimees_{year}.csv"
+    required = ["annee_nuitees", "code_commune", "code_departement",
+                "code_region", *MEASURES,
+                "statut_hotels", "statut_campings", "statut_autres"]
+    df = lire(path, required)
+    if df.empty or not df["annee_nuitees"].eq(str(year)).all():
+        raise ValueError(f"{year} : millésime incorrect ou fichier vide")
+    for field in ["code_commune", "code_departement", "code_region"]:
+        df[field] = df[field].str.strip().str.upper()
+    if not df["code_commune"].str.fullmatch(r"(?:[0-9]{5}|2[AB][0-9]{3})", na=False).all():
+        raise ValueError(f"{year} : codes de communes invalides")
+    if df["code_commune"].duplicated().any():
+        raise ValueError(f"{year} : communes en double")
+    if not df["code_departement"].eq(df["code_commune"].str[:2]).all():
+        raise ValueError(f"{year} : incohérence commune-département")
+    mapped_reg = df["code_departement"].map(DEP_TO_REG)
+    if mapped_reg.isna().any() or not mapped_reg.eq(df["code_region"]).all():
+        raise ValueError(f"{year} : code région incorrect")
+    for col in MEASURES:
+        df[col] = convertir(df[col])
+        if df[col].lt(0).any():
+            raise ValueError(f"{year} : nuitées négatives : {col}")
+    for category, (value_col, _, _) in CATEGORIES.items():
+        status_col = f"statut_{category}"
+        estimated = df[status_col].eq("estimé")
+        if not estimated.eq(df[value_col].notna()).all():
+            raise ValueError(
+                f"{year} : discordance entre statut et nuitées pour {category}"
+            )
+    return df
+
+
+def charger_observations(year):
+    path = PROCESSED / str(year) / f"nuites_{year}.csv"
+    df = lire(path, ["GEO", "Hotels", "Campings", "Autres"])
+    if "annee" in df and not df["annee"].eq(str(year)).all():
+        raise ValueError(f"{path.name} : année incohérente")
+    df["DEP"] = code_geo(df["GEO"], "DEP")
+    df["REG"] = code_geo(df["GEO"], "REG")
+    for _, (col, _, _) in CATEGORIES.items():
+        pass
+    for col in ("Hotels", "Campings", "Autres"):
+        df[col] = convertir(df[col])
+    return df
+
+
+def consolider(df, year, level, geo_col):
+    if level == "COM":
+        result = df[["code_commune", "code_departement", "code_region", *MEASURES]].copy()
+        result = result.rename(columns={"code_commune": "geocode"})
+        result["nb_communes"] = 1
+        for cat, (value, _, _) in CATEGORIES.items():
+            result[f"nb_communes_renseignees_{cat}"] = result[value].notna().astype(int)
+            result[f"couverture_complete_{cat}"] = result[value].notna()
+    else:
+        records = []
+        for code, group in df.groupby(geo_col, sort=True):
+            item = {
+                "geocode": code,
+                "code_departement": code if level == "DEP" else pd.NA,
+                "code_region": DEP_TO_REG[code] if level == "DEP" else code,
+                "nb_communes": len(group),
+            }
+            for cat, (value, _, _) in CATEGORIES.items():
+                present = int(group[value].notna().sum())
+                complete = present == len(group)
+                item[f"nb_communes_renseignees_{cat}"] = present
+                item[f"couverture_complete_{cat}"] = complete
+                item[value] = group[value].sum() if complete else np.nan
+            records.append(item)
+        result = pd.DataFrame.from_records(records)
+    result.insert(0, "annee", year)
+    result.insert(1, "admin_level", level)
+    # Jamais de total annuel homogène si les campings ne couvrent que la haute saison.
+    result["nuites_total_mixte_estime"] = result[MEASURES].sum(axis=1, min_count=3)
+    result["periode_total_mixte"] = "campings haute saison; hôtels et autres année complète"
+    result["type_donnee"] = "ESTIMATION_ISSUE_SCRIPT_20"
+    return result
+
+
+def verifier(df, observations, year):
+    # Comparer uniquement les totaux de référence dont les territoires sont
+    # entièrement estimés, sans transformer une lacune en zéro.
+    controle = []
+    for level, field in (("DEP", "DEP"), ("REG", "REG")):
+        territory = df[df["admin_level"].eq(level)].copy()
+        for category, (estimated_col, observed_col, source_level) in CATEGORIES.items():
+            if level != source_level:
+                continue
+            ref = observations.loc[observations[field].notna(), [field, observed_col]].copy()
+            if ref[field].duplicated().any():
+                raise ValueError(f"{year} : référence observée dupliquée pour {category}")
+            merged = territory.merge(ref, left_on="geocode", right_on=field,
+                                     how="left", validate="one_to_one")
+            for _, row in merged.iterrows():
+                observed = row[observed_col]
+                est = row[estimated_col]
+                complete = bool(row[f"couverture_complete_{category}"])
+                if complete and pd.notna(observed):
+                    if pd.isna(est) or not np.isclose(est, observed, atol=0.01, rtol=1e-10):
+                        raise ValueError(
+                            f"{year} : conservation non respectée, "
+                            f"{category} {row['geocode']}: {est} != {observed}"
+                        )
+                if pd.isna(observed) and pd.notna(est):
+                    raise ValueError(
+                        f"{year} : estimation sans total INSEE pour "
+                        f"{category} {row['geocode']}"
+                    )
+                controle.append({
+                    "annee": year, "niveau": level,
+                    "categorie": category, "geocode": row["geocode"],
+                    "nuites_source_insee": observed,
+                    "nuites_estimees": est,
+                    "couverture_complete": complete,
+                    "ecart": est - observed if pd.notna(est) and pd.notna(observed) else np.nan,
+                })
+    return pd.DataFrame(controle)
+
+
+def run_year(year):
+    print(f"\n=== SCRIPT 51 - TOURISME MARCHAND {year} ===")
+    communes = charger_communes(year)
+    observations = charger_observations(year)
+    com = consolider(communes, year, "COM", "code_commune")
+    dep = consolider(communes, year, "DEP", "code_departement")
+    reg = consolider(communes, year, "REG", "code_region")
+    if len(dep) != 96 or len(reg) != 13:
+        raise ValueError(f"{year} : couverture géographique inattendue ({len(dep)} DEP, {len(reg)} REG)")
+    result = pd.concat([com, dep, reg], ignore_index=True)
+    check = verifier(result, observations, year)
+    folder = PROCESSED / str(year)
+    output = folder / f"tourisme_marchand_com_dep_reg_{year}.csv"
+    controls = folder / f"controle_tourisme_marchand_{year}.csv"
+    result.to_csv(output, index=False, encoding="utf-8-sig")
+    check.to_csv(controls, index=False, encoding="utf-8-sig")
+    print(f"  Territoires : {len(com)} COM, {len(dep)} DEP, {len(reg)} REG")
+    for cat, (col, _, _) in CATEGORIES.items():
+        for lvl, part in (("COM", com), ("DEP", dep), ("REG", reg)):
+            print(f"  {cat:9s} {lvl}: {part[col].notna().sum():5d} / {len(part)} territoires avec total complet")
+    print("  Export :", output)
+    print("  Contrôle :", controls)
+
 
 def main():
-    OUT.mkdir(parents=True, exist_ok=True)
-    if not NON.exists():
-        raise FileNotFoundError(f'Exécuter d’abord le script 50 : {NON}')
-    print('1/3 — Reprise des communes et des correspondances géographiques validées')
-    nm = pd.read_csv(NON, dtype={'geocode':str, 'admin_level':str})
-    for c in ('geocode','admin_level','family_nights_year'):
-        if c not in nm.columns: raise ValueError(f'Colonne absente du fichier non marchand : {c}')
-    com = nm.loc[nm.admin_level.eq('COM'), ['geocode','family_nights_year']].copy()
-    if com.empty: raise ValueError('Aucune commune COM dans le fichier non marchand.')
-    if com.geocode.duplicated().any(): raise ValueError('Doublons COM.')
-    com['population_proxy'] = pd.to_numeric(com.family_nights_year,errors='coerce')
-    if com.population_proxy.isna().any() or com.population_proxy.sum()<=0:
-        raise ValueError('Poids population indisponibles.')
+    parser = argparse.ArgumentParser(description="CAFÉ 51 : tourisme marchand 2022-2025")
+    parser.add_argument("--year", type=int, choices=YEARS)
+    args = parser.parse_args()
+    years = [args.year] if args.year is not None else YEARS
+    for year in years:
+        run_year(year)
+    print("\n=== SCRIPT 51 TERMINÉ ===")
+    print("ATTENTION : campings = haute saison uniquement; valeurs manquantes conservées.")
 
-    # Geographic crosswalk from capacity file; fallback to a documented national DEP->REG map.
-    if not CAP.exists(): raise FileNotFoundError(CAP)
-    caps = pd.read_csv(CAP,dtype=str,low_memory=False)
-    gc=col(caps.columns,('geocode','GEO','CODGEO','code_commune'))
-    dc=col(caps.columns,('code_departement','departement','DEP'))
-    rc=col(caps.columns,('code_region','region','REG'))
-    if gc is None: raise ValueError(f'Code commune absent de {CAP.name}: {list(caps.columns)}')
-    caps['geocode_norm']=caps[gc].map(code)
-    caps=caps.dropna(subset=['geocode_norm'])
-    if dc and rc:
-        geo=caps[['geocode_norm',dc,rc]].drop_duplicates('geocode_norm').rename(columns={'geocode_norm':'geocode',dc:'dep',rc:'reg'})
-        geo['dep']=geo.dep.astype(str).str.replace(r'^\d{4}-DEP-','',regex=True).str.upper().str.zfill(2)
-        geo['reg']=geo.reg.astype(str).str.replace(r'^\d{4}-REG-','',regex=True).str.zfill(2)
-    else:
-        geo=caps[['geocode_norm']].drop_duplicates().rename(columns={'geocode_norm':'geocode'})
-        geo['dep']=geo.geocode.str[:2]
-        geo.loc[geo.geocode.str.startswith('97'),'dep']=geo.geocode.str[:3]
-        geo['reg']=pd.NA
-    # Robust department-region mapping (metropolitan INSEE regions since 2016).
-    regions={
-      '11':'75 77 78 91 92 93 94 95',
-      '24':'18 28 36 37 41 45',
-      '27':'21 25 39 58 70 71 89 90',
-      '28':'14 27 50 61 76',
-      '32':'02 59 60 62 80',
-      '44':'08 10 51 52 54 55 57 67 68 88',
-      '52':'44 49 53 72 85',
-      '53':'22 29 35 56',
-      '75':'16 17 19 23 24 33 40 47 64 79 86 87',
-      '76':'09 11 12 30 31 32 34 46 48 65 66 81 82',
-      '84':'01 03 07 15 26 38 42 43 63 69 73 74',
-      '93':'04 05 06 13 83 84',
-      '94':'2A 2B',
-    }
-    dep_to_reg={d:r for r,ds in regions.items() for d in ds.split()}
-    geo['reg']=geo.dep.map(dep_to_reg)  # do not trust invalid source region labels
-    com=com.merge(geo[['geocode','dep','reg']],on='geocode',how='left',validate='one_to_one')
-    missing_geo=com.dep.isna() | com.reg.isna()
-    if missing_geo.any():
-        com.loc[missing_geo].to_csv(OUT/'MARCHAND_COMMUNES_SANS_GEOGRAPHIE.csv',index=False,encoding='utf-8-sig')
-        print(f'Communes sans géographie exclues : {missing_geo.sum()}')
-        com=com.loc[~missing_geo].copy()
-    if com.empty: raise ValueError('Aucune commune géographiquement appariée.')
 
-    print('2/3 — Répartition provisoire des nuitées annuelles')
-    methods=[]
-    for kind,total,target in [('hotel',HOTEL_TOTAL,'hotel_nights_year'),('other',OTHER_TOTAL,'other_nights_year')]:
-        wc=find_weight_column(caps.columns,kind)
-        weights=None
-        if wc:
-            temp=caps[['geocode_norm',wc]].copy()
-            temp[wc]=pd.to_numeric(temp[wc].astype(str).str.replace(',','.',regex=False),errors='coerce')
-            temp=temp.groupby('geocode_norm')[wc].sum(min_count=1)
-            candidate=com.geocode.map(temp).fillna(0)
-            if candidate.ge(0).all() and candidate.sum()>0:
-                weights=candidate
-        if weights is None:
-            weights=com.population_proxy
-            method='population 2023 (proxy)'
-        else:
-            method=f'capacité 2022 : {wc}'
-        com[target]=total*weights/weights.sum()
-        methods.append((target,method))
-    # Only high-season camping observations available, not a yearly figure.
-    com['camping_nights_year']=pd.NA
-    cols=['hotel_nights_year','camping_nights_year','other_nights_year']
-    out=[]
-    for level,key in [('COM','geocode'),('DEP','dep'),('REG','reg')]:
-        if level=='COM': part=com[['geocode']+cols].copy()
-        else:
-            part=com.groupby(key,as_index=False)[['hotel_nights_year','other_nights_year']].sum().rename(columns={key:'geocode'})
-            part['camping_nights_year']=pd.NA
-        part.insert(1,'admin_level',level)
-        out.append(part)
-    result=pd.concat(out,ignore_index=True)
-    ordered=['geocode','admin_level']
-    for kind in ('hotel','camping','other'):
-        ordered.append(f'{kind}_nights_year')
-        for m in MONTHS:
-            c=f'{kind}_nights_{m}'
-            result[c]=pd.NA
-            ordered.append(c)
-    result=result[ordered]
-    output=OUT/'TOURISME_MARCHAND_2022_COM_DEP_REG_PROVISOIRE.csv'
-    result.to_csv(output,index=False,encoding='utf-8-sig')
-    metadata=OUT/'METHODOLOGIE_MARCHAND_2022.txt'
-    metadata.write_text('\n'.join([
-      'CAFÉ 2022 — TOURISME MARCHAND, ESTIMATION PROVISOIRE',
-      'Les nuitées COM/DEP/REG ne sont pas des mesures observées localement.',
-      f'Hôtels annuel national : {HOTEL_TOTAL:,} (arrondi, source à vérifier).',
-      f'Autres annuel national : {OTHER_TOTAL:,} (arrondi, source à vérifier).',
-      f'Campings : {CAMPING_HIGH_SEASON:,} haute saison seulement ; annuel NON RENSEIGNÉ.',
-      'Mois non renseignés faute de série mensuelle complète et validée.',
-      'Répartition géographique alignée sur le référentiel non marchand provisoire.',
-      *[f'{k} : {v}' for k,v in methods],
-      'Les capacités sont des clés de répartition, pas des nuitées.',
-      'Validation requise avant publication définitive.',
-    ]),encoding='utf-8')
-    print('3/3 — Contrôle')
-    for level in ('COM','DEP','REG'):
-        x=result.loc[result.admin_level.eq(level)]
-        assert abs(x.hotel_nights_year.sum()-HOTEL_TOTAL)<0.01
-        assert abs(x.other_nights_year.sum()-OTHER_TOTAL)<0.01
-        print(f'{level}: {len(x)} territoires | hôtels {x.hotel_nights_year.sum():,.0f} | autres {x.other_nights_year.sum():,.0f} | camping annuel manquant')
-    print('Méthodes :',methods)
-    print('Livraison :',output)
-    print('Note :',metadata)
-
-if __name__=='__main__':
+if __name__ == "__main__":
     main()

@@ -3,7 +3,7 @@
 Sources : script 51 (annuel COM/DEP/REG), DS_TOUR_FREQ (séries mensuelles).
 Hôtels : profil mensuel départemental, sinon régional, sinon national métropolitain.
 Autres : profil régional, sinon national métropolitain.
-Campings : haute saison seulement dans le script 51 ; aucun mois fabriqué.
+Campings : répartition avril-septembre selon profils mensuels régionaux INSEE (I553).
 Les mois sont des estimations par pondération, pas des mesures communales.
 """
 from pathlib import Path
@@ -36,7 +36,8 @@ REGIONS = {
 DEP_TO_REG = {dep: reg for reg, departments in REGIONS.items()
               for dep in departments.split()}
 CATS = {'hotel': ('I551', 'nuites_hotels_estimees'),
-        'other': ('I552', 'nuites_autres_estimees')}
+        'other': ('I552', 'nuites_autres_estimees'),
+        'camping': ('I553', 'nuites_campings_estimees')}
 
 
 def numeric(series):
@@ -51,7 +52,7 @@ def lire_mensuel():
             'TOUR_RESID', 'UNIT_LOC_RANKING', 'HOTEL_STA', 'EQUIP',
             'OBS_VALUE_NIVEAU', 'OBS_STATUS', 'UNIT_MULT', 'SEASONALITY']
     raw = pd.read_csv(RAW, usecols=cols, dtype=str, low_memory=False)
-    mask = (raw['FREQ'].eq('M') & raw['ACTIVITY'].isin(['I551', 'I552'])
+    mask = (raw['FREQ'].eq('M') & raw['ACTIVITY'].isin(['I551', 'I552', 'I553'])
             & raw['TOUR_MEASURE'].eq('NIGHT_SPENT')
             & raw['TOUR_RESID'].eq('_T')
             & raw['UNIT_LOC_RANKING'].eq('_T')
@@ -80,17 +81,24 @@ def lire_mensuel():
 
 
 def construire_profils(d):
-    """Garder uniquement 12 mois complets, sommer strictement positivement."""
+    """12 mois pour hôtels/autres ; 6 mois (avril-septembre) pour camping."""
     profils = {}
     for (year, activity, level, code), group in d.groupby(
             ['annee', 'ACTIVITY', 'niveau', 'code']):
-        if set(group['mois']) != set(range(1, 13)) or len(group) != 12:
+        expected = set(range(4, 10)) if activity == 'I553' else set(range(1, 13))
+        if set(group['mois']) != expected or len(group) != len(expected):
             continue
         group = group.sort_values('mois')
         total = group['valeur'].sum()
         if not np.isfinite(total) or total <= 0:
             continue
         poids = group['valeur'].to_numpy(dtype=float) / total
+        if activity == 'I553':
+            # Janvier-mars et octobre-décembre : hors période d'observation,
+            # mettre 0 pour les mois hors période, uniquement comme convention d’allocation.
+            padded = np.zeros(12, dtype=float)
+            padded[3:9] = poids
+            poids = padded
         profils[(year, activity, level, code)] = (
             poids, 'P' if group['OBS_STATUS'].eq('P').any() else 'A')
     return profils
@@ -166,17 +174,19 @@ def effectuer(year, profiles):
             if len(idx):
                 values = com.loc[idx, annual].to_numpy(dtype=float)
                 for k, month_col in enumerate(month_cols):
-                    com.loc[idx, month_col] = values * weights[k]
+                    if np.isfinite(weights[k]):
+                        com.loc[idx, month_col] = values * weights[k]
                 com.loc[idx, f'{prefix}_profil_source'] = method
                 com.loc[idx, f'{prefix}_profil_statut_insee'] = quality
         # Contrôle de conservation sur toutes les communes renseignées.
-        complete = com[month_cols].notna().all(axis=1)
+        valid_months = month_cols
+        complete = com[valid_months].notna().all(axis=1)
         if complete.ne(com[annual].notna()).any():
             raise ValueError(f'Profil mensuel manquant pour une commune {prefix}')
-        differences = (com.loc[complete, month_cols].sum(axis=1) -
+        differences = (com.loc[complete, valid_months].sum(axis=1) -
                        com.loc[complete, annual]).abs()
         if len(differences) and differences.max() > 0.01:
-            raise ValueError(f'12 mois ≠ annuel : {prefix}')
+            raise ValueError(f'Somme des mois ≠ total de référence : {prefix}')
         report.append({'annee': year, 'categorie': prefix,
                        'communes_mensuelles': int(complete.sum()),
                        'communes_total': len(com),
@@ -184,10 +194,8 @@ def effectuer(year, profiles):
                        'profil_reg': int(com[f'{prefix}_profil_source'].eq('REG').sum()),
                        'profil_france': int(com[f'{prefix}_profil_source'].eq('FM').sum())})
 
-    # Campings : ne pas réinterpréter un total haute saison comme annuel.
-    for m in MONTHS:
-        com[f'camping_nights_{m}'] = np.nan
-    com['camping_mensuel_statut'] = 'NON_ESTIME_HAUTE_SAISON'
+    # Les six mois hors saison sont 0 alloué, PAS zéro nuitée observée.
+    com['camping_mensuel_statut'] = 'HAUTE_SAISON_INSEE_HORS_SAISON_ZERO_ALLOUE'
 
     generated = [f'{prefix}_nights_{m}' for prefix in ('hotel', 'other', 'camping')
                  for m in MONTHS]
@@ -201,12 +209,13 @@ def effectuer(year, profiles):
         )
         base = base.merge(grouped, left_on='geocode', right_index=True,
                           how='left', validate='one_to_one')
-        for prefix in ('hotel', 'other'):
+        for prefix in ('hotel', 'other', 'camping'):
             months = [f'{prefix}_nights_{m}' for m in MONTHS]
-            valid = base[months].notna().all(axis=1)
+            expected_months = months
+            valid = base[expected_months].notna().all(axis=1)
             if valid.ne(base[CATS[prefix][1]].notna()).any():
                 raise ValueError(f'{year} {level}: couverture des mois incohérente ({prefix})')
-            err = (base.loc[valid, months].sum(axis=1) -
+            err = (base.loc[valid, expected_months].sum(axis=1) -
                    base.loc[valid, CATS[prefix][1]]).abs()
             if len(err) and err.max() > 0.01:
                 raise ValueError(f'{year} {level}: 12 mois ≠ annuel ({prefix})')
@@ -214,12 +223,12 @@ def effectuer(year, profiles):
         base['other_profil_source'] = 'AGREGATION_COM'
         base['hotel_profil_statut_insee'] = pd.NA
         base['other_profil_statut_insee'] = pd.NA
-        base['camping_mensuel_statut'] = 'NON_ESTIME_HAUTE_SAISON'
+        base['camping_mensuel_statut'] = 'AGREGATION_COM_HAUTE_SAISON_ZERO_ALLOUE'
         all_frames.append(base)
     output = pd.concat(all_frames, ignore_index=True)
     output['methode_mensuelle'] = ('profils mensuels observés INSEE, '
                                    'application aux nuitées annuelles estimées; '
-                                   'campings haute saison non ventilés')
+                                   'campings : profils régionaux INSEE avril-septembre; hors saison 0 alloué')
     dest = PROCESSED / str(year) / f'tourisme_marchand_mensuel_com_dep_reg_{year}.csv'
     profile_path = PROCESSED / str(year) / f'controle_profils_mensuels_{year}.csv'
     output.to_csv(dest, index=False, encoding='utf-8-sig')
@@ -230,7 +239,7 @@ def effectuer(year, profiles):
               f"FM {row['profil_france']:,}")
     print('  Export :', dest)
     print('  Contrôle :', profile_path)
-    print('  Camping : haute saison uniquement ; mois laissés vides')
+    print('  Camping : avril-septembre profil INSEE ; hors saison = 0 alloué (non observé)')
 
 
 def main():

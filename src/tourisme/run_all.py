@@ -1,9 +1,16 @@
-"""CAFÉ - orchestrateur tourisme 2022-2025.
+"""CAFÉ — orchestrateur simplifié, 2022–2025.
 
-À placer dans src/tourisme/run_all.py.
-Les sources INSEE brutes doivent déjà être présentes. L'extraction via 09
-n'est pas relancée automatiquement (réseau et téléchargements volumineux).
-Les fichiers CAFE_TOURISME_*_V2.csv restent intacts par cet orchestrateur.
+Depuis la racine du dépôt :
+  python src/tourisme/run_all.py --finalize   # 52 puis 54, sans relancer le reste
+  python src/tourisme/run_all.py              # chaîne complète 13 à 54
+  python src/tourisme/run_all.py --verify-only # uniquement présence des sorties
+  python src/tourisme/run_all.py --only-stage 53
+  python src/tourisme/run_all.py --from-stage 51
+
+Le script 09 reste volontairement manuel (téléchargements lourds).
+Les contrôles de conservation COM/DEP/REG et mensuels restent dans les
+scripts de calcul. Le bilan détaillé des valeurs manquantes n'est pas affiché.
+Le non-marchand reste un scénario exploratoire (solution B, France + DOM).
 """
 from __future__ import annotations
 
@@ -19,175 +26,124 @@ RAW = ROOT / "data" / "raw" / "tourisme"
 PROCESSED = ROOT / "data" / "processed" / "tourisme"
 FINAL = ROOT / "data" / "final" / "tourisme"
 YEARS = (2022, 2023, 2024, 2025)
-DELIVERABLE_YEARS = (2023, 2024, 2025)
-DELIVERABLE_TYPES = ("MARCHAND", "NON_MARCHAND")
 
-# Une étape = un script existant et les fichiers qui prouvent son exécution.
-# 49 et 50 génèrent des CLÉS ; les nuitées non marchandes restent bloquées
-# jusqu'à validation du périmètre géographique des totaux.
+# (Identifiant, script, modèle du fichier attendu sous processed/tourisme)
 STAGES = (
-    ("13", "download/13_nuitees_2022_2025.py",
-     "{year}/nuites_{year}.csv"),
-    ("18", "distribution_com/18_capacites_communales.py",
-     "{year}/capacites_communales_{year}.csv"),
-    ("20", "distribution_com/20_estimation_nuitees_communales.py",
-     "{year}/nuites_communales_estimees_{year}.csv"),
-    ("46", "distribution_com/46_nonmarche.py",
-     "{year}/nuites_non_marchandes_{year}.csv"),
-    ("47", "distribution_com/47_logements_2022.py",
-     "{year}/residences_secondaires_occasionnelles_{year}_communes.csv"),
-    ("49", "distribution_com/49_integration_non_marchand.py",
-     "{year}/cles_repartition_non_marchand_{year}.csv"),
-    ("50", "distribution_com/50_non_marchand_com_dep_reg.py",
-     "{year}/cles_non_marchandes_com_dep_reg_{year}.csv"),
-    ("51", "distribution_com/51_tourisme_marchand_2022.py",
-     "{year}/tourisme_marchand_com_dep_reg_{year}.csv"),
-    ("53", "distribution_com/53_ventilation_mensuelle_2022.py",
-     "{year}/tourisme_marchand_mensuel_com_dep_reg_{year}.csv"),
+    ("13", "download/13_nuitees_2022_2025.py", "nuites_{year}.csv"),
+    ("18", "distribution_com/18_capacites_communales.py", "capacites_communales_{year}.csv"),
+    ("20", "distribution_com/20_estimation_nuitees_communales.py", "nuites_communales_estimees_{year}.csv"),
+    ("46", "distribution_com/46_nonmarche.py", "nuites_non_marchandes_{year}.csv"),
+    ("47", "distribution_com/47_logements_2022.py", "residences_secondaires_occasionnelles_{year}_communes.csv"),
+    ("49", "distribution_com/49_integration_non_marchand.py", "cles_repartition_non_marchand_{year}.csv"),
+    ("50", "distribution_com/50_non_marchand_com_dep_reg.py", "cles_non_marchandes_com_dep_reg_{year}.csv"),
+    ("51", "distribution_com/51_tourisme_marchand_2022.py", "tourisme_marchand_com_dep_reg_{year}.csv"),
+    ("52", "distribution_com/52_scenario_non_marchand_2022_2025.py", "scenario_non_marchand_com_dep_reg_{year}.csv"),
+    ("53", "distribution_com/53_ventilation_mensuelle_2022.py", "tourisme_marchand_mensuel_com_dep_reg_{year}.csv"),
+    ("54", "54_assembler_cafe_2022_2025.py", None),
 )
 
 
-def args_parser() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "--from-stage", choices=[s[0] for s in STAGES], metavar="N",
-        help="Reprendre depuis une étape (ex. --from-stage 51)",
-    )
-    group.add_argument(
-        "--only-stage", choices=[s[0] for s in STAGES], metavar="N",
-        help="Exécuter une seule étape (ex. --only-stage 53)",
-    )
-    parser.add_argument(
-        "--visualize", action="store_true",
-        help="Créer le classeur Excel V2 2023-2025 à partir des six CSV V2 existants",
-    )
-    parser.add_argument(
-        "--verify-only", action="store_true",
-        help="Vérifier les sorties produites sans exécuter les scripts",
-    )
-    return parser.parse_args()
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--finalize", action="store_true", help="Exécuter seulement 52 puis 54")
+    mode.add_argument("--only-stage", choices=[s[0] for s in STAGES], help="Exécuter une étape")
+    mode.add_argument("--from-stage", choices=[s[0] for s in STAGES], help="Reprendre à une étape")
+    mode.add_argument("--verify-only", action="store_true", help="Vérifier les fichiers, sans calcul")
+    p.add_argument("--verbose", action="store_true", help="Afficher toutes les sorties des scripts")
+    return p.parse_args()
 
 
-def choose_stages(args: argparse.Namespace):
-    if args.only_stage:
-        return [s for s in STAGES if s[0] == args.only_stage]
-    if args.from_stage:
-        start = next(i for i, s in enumerate(STAGES) if s[0] == args.from_stage)
-        return STAGES[start:]
+def select_stages(a):
+    if a.finalize:
+        return [s for s in STAGES if s[0] in ("52", "54")]
+    if a.only_stage:
+        return [s for s in STAGES if s[0] == a.only_stage]
+    if a.from_stage:
+        n = next(i for i, s in enumerate(STAGES) if s[0] == a.from_stage)
+        return STAGES[n:]
     return STAGES
 
 
-def check_raw_sources(selected) -> None:
+def outputs(stage):
+    id_, _, template = stage
+    if id_ == "54":
+        result = []
+        for year in YEARS:
+            result += [
+                FINAL / f"CAFE_TOURISME_{year}.xlsx",
+                FINAL / str(year) / f"CAFE_TOURISME_{year}_MARCHAND_V2.csv",
+                FINAL / str(year) / f"CAFE_TOURISME_{year}_NON_MARCHAND_V2.csv",
+            ]
+        return result
+    return [PROCESSED / str(y) / template.format(year=y) for y in YEARS]
+
+
+def check_outputs(stage):
+    missing = [str(p) for p in outputs(stage) if not p.is_file() or p.stat().st_size == 0]
+    if missing:
+        raise FileNotFoundError("Sorties de l'étape " + stage[0] + " absentes ou vides :\n" + "\n".join(missing))
+
+
+def check_raw(stages):
+    ids = {s[0] for s in stages}
     required = {}
-    ids = {s[0] for s in selected}
-    if "13" in ids:
-        required["fréquentation INSEE (script 09)"] = RAW / "frequentation_brut.csv"
-    if "46" in ids:
-        required["suivi de la demande touristique (script 09)"] = (
-            RAW / "tourisme_national_brut.csv"
-        )
-    missing = [f"{label} : {path}" for label, path in required.items() if not path.is_file()]
-    if missing:
-        raise FileNotFoundError(
-            "Sources brutes manquantes :\n" + "\n".join(missing)
-            + "\nExécuter d'abord le script 09 pour les jeux concernés."
-        )
+    if ids & {"13", "53", "54"}:
+        required["fréquentation INSEE"] = RAW / "frequentation_brut.csv"
+    if ids & {"46", "52"}:
+        required["tourisme national INSEE"] = RAW / "tourisme_national_brut.csv"
+    absent = [f"{label}: {path}" for label, path in required.items() if not path.is_file()]
+    if absent:
+        raise FileNotFoundError("Sources INSEE introuvables :\n" + "\n".join(absent))
 
 
-def expected_files(stage) -> list[Path]:
-    template = stage[2]
-    return [PROCESSED / template.format(year=year) for year in YEARS]
-
-
-def verify_step(stage) -> None:
-    missing = [p for p in expected_files(stage) if not p.is_file() or p.stat().st_size == 0]
-    if missing:
-        raise FileNotFoundError(
-            f"Sortie de l'étape {stage[0]} absente ou vide :\n"
-            + "\n".join(str(path) for path in missing)
-        )
-    print(f"  [OK] 4 fichiers annuels présents et non vides (étape {stage[0]})", flush=True)
-
-
-def run_step(stage) -> None:
-    name, relative_path, _ = stage
-    script = TOURISME / relative_path
+def run_stage(stage, verbose):
+    ident, rel_path, _ = stage
+    script = TOURISME / rel_path
     if not script.is_file():
-        raise FileNotFoundError(f"Script {name} introuvable : {script}")
-    print(f"\n{'=' * 66}\nÉTAPE {name} : {script.name}\n{'=' * 66}", flush=True)
-    started = time.perf_counter()
-    subprocess.run([sys.executable, str(script)], cwd=ROOT, check=True)
-    verify_step(stage)
-    print(f"  Durée : {time.perf_counter() - started:.1f} secondes", flush=True)
-
-
-def verify_v2() -> list[Path]:
-    missing = []
-    print("\n=== Livraison V2 existante (2023-2025) ===")
-    for year in DELIVERABLE_YEARS:
-        for kind in DELIVERABLE_TYPES:
-            path = PROCESSED / str(year) / f"CAFE_TOURISME_{year}_{kind}_V2.csv"
-            if path.is_file() and path.stat().st_size > 0:
-                print(f"  [OK] {year} {kind}")
-            else:
-                print(f"  [ABSENT] {path}")
-                missing.append(path)
-    return missing
-
-
-def visualize_v2() -> None:
-    missing = verify_v2()
-    if missing:
-        raise FileNotFoundError(
-            "Visualisation V2 impossible : " + str(len(missing))
-            + " fichier(s) V2 manquant(s). Les sorties 51/53 ne remplacent "
-              "pas automatiquement les livrables V2."
+        raise FileNotFoundError(f"Script {ident} absent : {script}")
+    t0 = time.perf_counter()
+    print(f"  [{ident}] {script.name}...", flush=True)
+    if verbose:
+        subprocess.run([sys.executable, str(script)], cwd=ROOT, check=True)
+    else:
+        completed = subprocess.run(
+            [sys.executable, str(script)], cwd=ROOT,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            errors="replace", check=False,
         )
-    script = TOURISME / "analysis" / "57_organiser_visualiser_cafe_2023_2025.py"
-    if not script.is_file():
-        raise FileNotFoundError(f"Script 57 introuvable : {script}")
-    FINAL.mkdir(parents=True, exist_ok=True)
-    # --no-copy évite toute copie susceptible de modifier les CSV V2.
-    subprocess.run(
-        [sys.executable, str(script),
-         "--input-dir", str(PROCESSED),
-         "--output-dir", str(FINAL),
-         "--no-copy"],
-        cwd=ROOT, check=True,
-    )
-    outfile = FINAL / "CAFE_TOURISME_2023_2025.xlsx"
-    if not outfile.is_file() or outfile.stat().st_size == 0:
-        raise FileNotFoundError(f"Classeur Excel non produit : {outfile}")
-    print(f"  [OK] Classeur V2 : {outfile}", flush=True)
+        if completed.returncode:
+            print(completed.stdout, file=sys.stderr, flush=True)
+            raise RuntimeError(f"Étape {ident} en échec (code {completed.returncode})")
+    check_outputs(stage)
+    print(f"       [OK] {len(outputs(stage))} sortie(s) présentes ({time.perf_counter() - t0:.1f}s)", flush=True)
 
 
-def main() -> None:
-    args = args_parser()
-    selected = choose_stages(args)
-    print("=== CAFÉ : orchestration tourisme 2022-2025 ===", flush=True)
-    print("Étapes :", " -> ".join(s[0] for s in selected), flush=True)
-    if not args.verify_only:
-        check_raw_sources(selected)
+def main():
+    args = parse_args()
+    selected = select_stages(args)
+    print("\n=== CAFÉ 2022–2025 ===", flush=True)
+    print("Étapes : " + " -> ".join(s[0] for s in selected), flush=True)
     try:
+        if not args.verify_only:
+            check_raw(selected)
         for stage in selected:
             if args.verify_only:
-                verify_step(stage)
+                check_outputs(stage)
+                print(f"  [{stage[0]}] OK : {len(outputs(stage))} fichier(s) présents", flush=True)
             else:
-                run_step(stage)
-        if args.visualize:
-            visualize_v2()
-        else:
-            print("\nVisualisation V2 inchangée (option : --visualize).")
-        print("\n=== EXÉCUTION TERMINÉE ===")
-        print("Marchand : sorties 13, 18, 20, 51 et 53 disponibles.")
-        print("Non marchand : 46 observé toutes destinations ; 47, 49, 50 fournissent des clés.")
-        print("Les nuitées non marchandes communales restent NON calculées sans totaux métropolitains validés.")
-        print("Les fichiers CAFE_TOURISME_*_V2.csv ne sont pas générés ni modifiés par ce pipeline.")
-    except (FileNotFoundError, subprocess.CalledProcessError) as error:
-        print(f"\n[ARRÊT] {error}", file=sys.stderr)
-        raise SystemExit(1) from error
+                run_stage(stage, args.verbose)
+    except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as exc:
+        print(f"\n[ÉCHEC] {exc}", file=sys.stderr, flush=True)
+        return 1
+    print("\n=== PIPELINE TERMINÉ ===", flush=True)
+    if any(s[0] == "54" for s in selected):
+        print("4 classeurs Excel : 2022, 2023, 2024, 2025", flush=True)
+        print("2 onglets par classeur : MARCHAND et NON_MARCHAND", flush=True)
+        print("Non marchand : scénario exploratoire (hypothèses documentées dans les sorties).", flush=True)
+    print("Les contrôles de sommes restent exécutés dans les scripts de calcul.", flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

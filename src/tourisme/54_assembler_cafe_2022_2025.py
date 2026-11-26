@@ -8,7 +8,8 @@ Sorties : data/final/tourisme/CAFE_TOURISME_{annee}.xlsx
          data/final/tourisme/{annee}/CAFE_TOURISME_{annee}_{TYPE}_V2.csv
 
 MARCHAND : résultats du script 53.
-NON_MARCHAND : s'il existe un ancien CSV V2 contenant réellement des
+NON_MARCHAND : priorité au scénario exploratoire explicitement documenté,
+si présent ; sinon les anciens CSV V2 contenant réellement des
 valeurs, les afficher dans l'onglet (statut NON VALIDÉ, indiqué dans Excel).
 Sinon conserver les cases de nuitées vides : aucune allocation inventée.
 """
@@ -231,6 +232,19 @@ def marchand(year, profiles):
 
 
 def source_non_marchand(year):
+    # PRIORITÉ explicite au scénario du script 52, jamais aux anciennes
+    # estimations V2 qui peuvent avoir une origine non documentée.
+    scenario = PROCESSED / str(year) / f"scenario_non_marchand_com_dep_reg_{year}.csv"
+    if scenario.is_file():
+        cols, records = read_csv_auto(scenario)
+        expected = {"geocode", "admin_level", *N_COLS[2:], "scenario",
+                    "hypothese_geographique", "hypothese_mensuelle"}
+        if not expected.issubset(cols):
+            raise ValueError(f"Scénario 52 incomplet : {sorted(expected - set(cols))}")
+        if not records or any(r.get("scenario") != "EXPLORATOIRE_NON_VALIDE"
+                              for r in records):
+            raise ValueError("Source 52 non identifiée comme scénario exploratoire")
+        return normalise(records, N_COLS), True, scenario
     filename = f"CAFE_TOURISME_{year}_NON_MARCHAND_V2.csv"
     # Priorité aux anciennes sorties réellement remplies ; le script 54
     # précédent a créé des fichiers entièrement vides.
@@ -286,9 +300,10 @@ def add_sheet(wb, name, cols, rows, unvalidated=False):
     if unvalidated:
         ws.write_comment(
             0, 2,
-            "ATTENTION : nuitées non marchandes reprises d'un ancien CSV V2 ; "
-            "leur allocation géographique et leur profil mensuel ne sont pas validés. "
-            "Données à usage exploratoire uniquement."
+            "SCÉNARIO EXPLORATOIRE NON VALIDÉ : les totaux INSEE TRAVEL_DEST=_T "
+            "couvrent toutes destinations, pas uniquement la métropole. "
+            "La répartition communale est une simulation ; les 12 mois sont "
+            "répartis uniformément (1/12) sans profil saisonnier observé."
         )
     for idx, row in enumerate(rows, start=1):
         ws.write_string(idx, 0, row["geocode"], code_fmt)
@@ -308,7 +323,7 @@ def main():
         m = marchand(year, profiles)
         nm, unvalidated, source = source_non_marchand(year)
         if unvalidated:
-            print(f"  [ATTENTION] NON_MARCHAND : valeurs historiques NON VALIDÉES : {source}")
+            print(f"  [ATTENTION] NON_MARCHAND : SCÉNARIO EXPLORATOIRE NON VALIDÉ : {source}")
         else:
             print("  [ATTENTE] NON_MARCHAND : pas de nuitées allouables ; colonnes vides.")
         dest = FINAL / f"CAFE_TOURISME_{year}.xlsx"

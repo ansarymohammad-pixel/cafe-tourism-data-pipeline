@@ -1,191 +1,220 @@
-"""CAFÉ — 52 : scénario EXPLORATOIRE non marchand (2022–2025).
+"""CAFÉ | Script 52 — solution B, scénario France + outre-mer, 2022–2025.
 
-Entrées : nuites_non_marchandes_{annee}.csv (script 46)
-          cles_non_marchandes_com_dep_reg_{annee}.csv (script 50).
-Sorties : data/processed/tourisme/{annee}/
-          scenario_non_marchand_com_dep_reg_{annee}.csv
-          scenario_non_marchand_hypotheses_{annee}.txt
+Sources :
+  data/raw/tourisme/tourisme_national_brut.csv (INSEE SDT, agrégats destination)
+  data/processed/tourisme/{annee}/nuites_non_marchandes_{annee}.csv (script 46)
+  data/processed/tourisme/{annee}/cles_non_marchandes_com_dep_reg_{annee}.csv (script 50)
+Sortie : scenario_non_marchand_com_dep_reg_{annee}.csv (lu par script 54).
 
-ATTENTION : TRAVEL_DEST=_T signifie toutes destinations, et NON la France
-métropolitaine. L'allocation aux communes françaises est donc une
-SIMULATION et non une estimation géographique validée.
-La mensualisation uniforme (1/12) est une HYPOTHÈSE EXPLORATOIRE, sans
-fondement saisonnier dans le jeu de données ici utilisé.
+HYPOTHÈSES (NE PAS INTERPRÉTER COMME DES OBSERVATIONS MÉTROPOLITAINES) :
+  1. Le ratio toutes catégories France + outre-mer / toutes destinations
+     est supposé identique pour famille/amis et résidences secondaires.
+  2. Les totaux ainsi ajustés sont attribués aux communes métropolitaines
+     à l'aide des poids population et logements (proxies 2023).
+  3. Profil mensuel uniforme (1/12), NON observé.
+Les contrôles de sommes COM -> DEP -> REG et mensuels sont intégrés.
 
-Conservation : somme des communes = département/région = total source,
-pour chacune des deux catégories et chacun des 12 mois.
+Commande : python src/tourisme/distribution_com/52_scenario_non_marchand_2022_2025.py
+Option : --year 2022
 """
 from __future__ import annotations
-
-from pathlib import Path
 import argparse
+from pathlib import Path
 import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[3]
-PROCESSED = ROOT / "data" / "processed" / "tourisme"
+RAW = ROOT / 'data' / 'raw' / 'tourisme' / 'tourisme_national_brut.csv'
+PROCESSED = ROOT / 'data' / 'processed' / 'tourisme'
 YEARS = (2022, 2023, 2024, 2025)
-MONTHS = ("january", "february", "march", "april", "may", "june",
-          "july", "august", "september", "october", "november", "december")
+MONTHS = ('january', 'february', 'march', 'april', 'may', 'june',
+          'july', 'august', 'september', 'october', 'november', 'december')
 CATEGORIES = {
-    "famille_amis": ("family_nights", "poids_famille_amis"),
-    "residences_secondaires": ("secondary_residence", "poids_residences_secondaires"),
+    'famille_amis': ('family_nights', 'poids_famille_amis'),
+    'residences_secondaires': ('secondary_residence', 'poids_residences_secondaires'),
 }
 REGIONS = {
-    "11": "75 77 78 91 92 93 94 95",
-    "24": "18 28 36 37 41 45",
-    "27": "21 25 39 58 70 71 89 90",
-    "28": "14 27 50 61 76",
-    "32": "02 59 60 62 80",
-    "44": "08 10 51 52 54 55 57 67 68 88",
-    "52": "44 49 53 72 85",
-    "53": "22 29 35 56",
-    "75": "16 17 19 23 24 33 40 47 64 79 86 87",
-    "76": "09 11 12 30 31 32 34 46 48 65 66 81 82",
-    "84": "01 03 07 15 26 38 42 43 63 69 73 74",
-    "93": "04 05 06 13 83 84",
-    "94": "2A 2B",
+    '11': '75 77 78 91 92 93 94 95', '24': '18 28 36 37 41 45',
+    '27': '21 25 39 58 70 71 89 90', '28': '14 27 50 61 76',
+    '32': '02 59 60 62 80', '44': '08 10 51 52 54 55 57 67 68 88',
+    '52': '44 49 53 72 85', '53': '22 29 35 56',
+    '75': '16 17 19 23 24 33 40 47 64 79 86 87',
+    '76': '09 11 12 30 31 32 34 46 48 65 66 81 82',
+    '84': '01 03 07 15 26 38 42 43 63 69 73 74',
+    '93': '04 05 06 13 83 84', '94': '2A 2B',
 }
 DEP_REG = {dep: reg for reg, deps in REGIONS.items() for dep in deps.split()}
-OUTPUT_COLS = (
-    ["geocode", "admin_level"]
-    + [col for prefix, _ in CATEGORIES.values()
-       for col in ([prefix + "_year"] + [prefix + "_" + m for m in MONTHS])]
-)
-META = {
-    "scenario": "EXPLORATOIRE_NON_VALIDE",
-    "hypothese_geographique": "TRAVEL_DEST=_T toutes destinations réparties sur communes métropolitaines",
-    "hypothese_mensuelle": "UNIFORME_1_SUR_12_NON_OBSERVEE",
-}
+VALUE_COLS = [col for prefix, _ in CATEGORIES.values()
+              for col in ([prefix + '_year'] + [prefix + '_' + m for m in MONTHS])]
 
 
-def path(year, filename):
-    return PROCESSED / str(year) / filename.format(year=year)
+def float_col(frame, name):
+    values = pd.to_numeric(frame[name].astype(str).str.replace(',', '.', regex=False),
+                           errors='coerce')
+    if values.isna().any() or not np.isfinite(values).all() or values.lt(0).any():
+        raise ValueError(f'Donnée absente, infinie ou négative : {name}')
+    return values.astype(float)
 
 
-def num_col(df, name):
-    x = pd.to_numeric(df[name].astype(str).str.replace(",", ".", regex=False),
-                      errors="coerce")
-    if x.isna().any() or (x < 0).any():
-        raise ValueError(f"Valeurs manquantes, non numériques ou négatives : {name}")
-    return x.astype(float)
+def assert_equal(actual, expected, what):
+    if not np.isclose(float(actual), float(expected), atol=0.01, rtol=0):
+        raise ValueError(f'[ECHEC SOMMES] {what} : {actual} != {expected}')
 
 
-def code(s, level):
-    s = str(s).strip().upper()
-    return s.zfill(5 if level == "COM" else 2) if s.isdigit() else s
+def destination_ratios():
+    if not RAW.is_file():
+        raise FileNotFoundError(f'Source SDT introuvable : {RAW}')
+    fields = ['GEO', 'SEASONAL_ADJUST', 'TOUR_MEASURE', 'TRAVEL_DEST',
+              'MODE_TRANSPORT', 'FREQ', 'TIME_PERIOD', 'UNIT_MEASURE',
+              'TYPE_TOUR_ACCOMODATION', 'TRAVEL_REASON', 'OBS_STATUS',
+              'UNIT_MULT', 'OBS_VALUE_NIVEAU']
+    raw = pd.read_csv(RAW, usecols=fields, dtype=str, low_memory=False)
+    mask = (raw['FREQ'].eq('A') & raw['TIME_PERIOD'].isin([str(y) for y in YEARS])
+            & raw['TOUR_MEASURE'].eq('NIGHT_SPENT')
+            & raw['TYPE_TOUR_ACCOMODATION'].eq('_T')
+            & raw['TRAVEL_REASON'].eq('_T')
+            & raw['TRAVEL_DEST'].isin(['250', '_T'])
+            & raw['GEO'].str.endswith('FRANCE-FM', na=False)
+            & raw['SEASONAL_ADJUST'].eq('N')
+            & raw['MODE_TRANSPORT'].eq('_T')
+            & raw['UNIT_MEASURE'].eq('NR')
+            & raw['OBS_STATUS'].isin(['A', 'P']))
+    sub = raw.loc[mask].copy()
+    sub['nuites'] = float_col(sub, 'OBS_VALUE_NIVEAU') * (10 ** float_col(sub, 'UNIT_MULT'))
+    if sub.duplicated(['TIME_PERIOD', 'TRAVEL_DEST']).any():
+        raise ValueError('Doublon de séries SDT destination : préciser les filtres')
+    table = sub.pivot(index='TIME_PERIOD', columns='TRAVEL_DEST', values='nuites')
+    if any(str(y) not in table.index for y in YEARS) or not {'250', '_T'}.issubset(table.columns):
+        raise ValueError('Séries annuelles France+outre-mer et toutes destinations incomplètes')
+    result = {}
+    for y in YEARS:
+        domestic = float(table.loc[str(y), '250'])
+        all_dest = float(table.loc[str(y), '_T'])
+        if not (0 < domestic <= all_dest):
+            raise ValueError(f'Ratio géographique impossible pour {y}')
+        result[y] = (domestic / all_dest, domestic, all_dest)
+    return result
 
 
-def ensure_close(actual, expected, label):
-    if not np.isclose(actual, expected, rtol=0, atol=0.01):
-        raise ValueError(f"Conservation échouée {label} : {actual} != {expected}")
+def perform(year, ratios):
+    print(f'\n=== SCÉNARIO B NON MARCHAND {year} ===')
+    folder = PROCESSED / str(year)
+    paths = (folder / f'cles_non_marchandes_com_dep_reg_{year}.csv',
+             folder / f'nuites_non_marchandes_{year}.csv')
+    for p in paths:
+        if not p.is_file():
+            raise FileNotFoundError(f'Exécuter les scripts 46 et 50 avant le 52 : {p}')
+    keys = pd.read_csv(paths[0], dtype=str, encoding='utf-8-sig')
+    totals = pd.read_csv(paths[1], dtype=str, encoding='utf-8-sig')
+    if not {'annee', 'admin_level', 'geocode', *(v[1] for v in CATEGORIES.values())}.issubset(keys):
+        raise ValueError('Colonnes manquantes dans les clés du script 50')
+    if not {'annee', 'categorie', 'nuites', 'TRAVEL_DEST'}.issubset(totals):
+        raise ValueError('Colonnes manquantes dans les totaux du script 46')
+    if not keys['annee'].eq(str(year)).all() or not totals['annee'].eq(str(year)).all():
+        raise ValueError('Année incohérente')
+    if not totals['TRAVEL_DEST'].eq('_T').all():
+        raise ValueError('Le périmètre des totaux a changé : réexaminer le scénario')
+    if len(totals) != 2 or set(totals['categorie']) != set(CATEGORIES):
+        raise ValueError('Il faut exactement famille_amis et residences_secondaires')
+    if keys.duplicated(['admin_level', 'geocode']).any():
+        raise ValueError('Doublon COM/DEP/REG')
 
-
-def effectuer(year):
-    print(f"\n=== SCÉNARIO NON MARCHAND {year} ===")
-    keys_file = path(year, "cles_non_marchandes_com_dep_reg_{year}.csv")
-    totals_file = path(year, "nuites_non_marchandes_{year}.csv")
-    if not keys_file.is_file() or not totals_file.is_file():
-        raise FileNotFoundError(f"Fichier du script 46/50 absent : {keys_file} / {totals_file}")
-    keys = pd.read_csv(keys_file, dtype=str, encoding="utf-8-sig")
-    totals = pd.read_csv(totals_file, dtype=str, encoding="utf-8-sig")
-    required = {"annee", "admin_level", "geocode",
-                "poids_famille_amis", "poids_residences_secondaires"}
-    if not required.issubset(keys):
-        raise ValueError(f"Clés 50 : colonnes absentes : {sorted(required - set(keys))}")
-    if not {"annee", "categorie", "nuites", "TRAVEL_DEST"}.issubset(totals):
-        raise ValueError("Script 46 : colonnes requises absentes")
-    if not keys["annee"].eq(str(year)).all() or not totals["annee"].eq(str(year)).all():
-        raise ValueError("Années incohérentes")
-    if not totals["TRAVEL_DEST"].eq("_T").all():
-        raise ValueError("La source a changé de périmètre : revoir les hypothèses")
-    if len(totals) != 2 or set(totals["categorie"]) != set(CATEGORIES):
-        raise ValueError("Il faut exactement deux catégories non marchandes")
-    if keys.duplicated(["admin_level", "geocode"]).any():
-        raise ValueError("Codes géographiques doublonnés dans les clés")
-
-    # NE PAS utiliser les clés agrégées en tant qu'observations supplémentaires :
-    # on commence exclusivement par les communes pour éviter le triple comptage.
-    com = keys.loc[keys["admin_level"].eq("COM")].copy()
+    com = keys.loc[keys['admin_level'].eq('COM')].copy()
     if com.empty:
-        raise ValueError("Aucune commune dans les clés 50")
-    com["geocode"] = com["geocode"].map(lambda x: code(x, "COM"))
-    com["code_departement"] = com["geocode"].str[:2]
-    com["code_region"] = com["code_departement"].map(DEP_REG)
-    if com["code_region"].isna().any():
-        raise ValueError("Commune sans région métropolitaine")
-    com["admin_level"] = "COM"
-    for cat, (prefix, weight_name) in CATEGORIES.items():
-        poids = num_col(com, weight_name).to_numpy()
-        s = poids.sum()
-        ensure_close(s, 1.0, f"poids {cat} {year}")
-        # Renormaliser les flottants pour conserver exactement le total.
-        poids = poids / s
-        total = float(num_col(totals.loc[totals["categorie"].eq(cat)],
-                              "nuites").iloc[0])
-        com[prefix + "_year"] = total * poids
+        raise ValueError('Aucune commune disponible')
+    com['geocode'] = com['geocode'].str.strip().str.upper().str.zfill(5)
+    if com['geocode'].duplicated().any():
+        raise ValueError('Communes en double')
+    com['code_departement'] = com['geocode'].str[:2]
+    com['code_region'] = com['code_departement'].map(DEP_REG)
+    if com['code_region'].isna().any():
+        raise ValueError('Commune sans région reconnue')
+
+    ratio, domestic, all_dest = ratios[year]
+    print(f'  Coefficient France+outre-mer : {domestic / 1e6:.1f} / '
+          f'{all_dest / 1e6:.1f} = {ratio:.6%}')
+    adjusted = {}
+    for category, (prefix, weight) in CATEGORIES.items():
+        total_source = float(float_col(totals.loc[totals['categorie'].eq(category)], 'nuites').iloc[0])
+        estimated_total = total_source * ratio
+        adjusted[category] = estimated_total
+        weights = float_col(com, weight).to_numpy(dtype=float)
+        if not np.isclose(weights.sum(), 1, atol=1e-7, rtol=0):
+            raise ValueError(f'Poids {weight} ne somment pas à 1')
+        weights = weights / weights.sum()
+        com[prefix + '_year'] = estimated_total * weights
         for month in MONTHS:
-            com[prefix + "_" + month] = com[prefix + "_year"] / 12
-    metrics = OUTPUT_COLS[2:]
-    frames = [com[["geocode", "admin_level"] + metrics].copy()]
-    for level, geo_col in (("DEP", "code_departement"), ("REG", "code_region")):
-        agg = com.groupby(geo_col, as_index=False)[metrics].sum()
-        agg = agg.rename(columns={geo_col: "geocode"})
-        agg.insert(1, "admin_level", level)
-        frames.append(agg[OUTPUT_COLS])
+            com[prefix + '_' + month] = com[prefix + '_year'] / 12
+        assert_equal(com[prefix + '_year'].sum(), estimated_total, f'{year} {prefix} TOTAL AJUSTÉ')
+        print(f'  {category} : {total_source / 1e6:.2f} M -> {estimated_total / 1e6:.2f} M (scénario)')
 
-    out = pd.concat(frames, ignore_index=True)
-    for col in metrics:
-        ensure_close(out.loc[out.admin_level.eq("COM"), col].sum(),
-                     out.loc[out.admin_level.eq("DEP"), col].sum(),
-                     f"COM/DEP {year}/{col}")
-        ensure_close(out.loc[out.admin_level.eq("COM"), col].sum(),
-                     out.loc[out.admin_level.eq("REG"), col].sum(),
-                     f"COM/REG {year}/{col}")
+    parts = [com[['geocode', 'admin_level', *VALUE_COLS]].copy()]
+    for level, col in [('DEP', 'code_departement'), ('REG', 'code_region')]:
+        aggregate = com.groupby(col, as_index=False)[VALUE_COLS].sum()
+        aggregate = aggregate.rename(columns={col: 'geocode'})
+        aggregate.insert(1, 'admin_level', level)
+        parts.append(aggregate[['geocode', 'admin_level', *VALUE_COLS]])
+    result = pd.concat(parts, ignore_index=True)
+    # Contrôles INTÉGRÉS : chaque colonne, les 3 niveaux, et les 12 mois.
+    for metric in VALUE_COLS:
+        a = result.loc[result.admin_level.eq('COM'), metric].sum()
+        b = result.loc[result.admin_level.eq('DEP'), metric].sum()
+        c = result.loc[result.admin_level.eq('REG'), metric].sum()
+        assert_equal(a, b, f'{year} {metric}: COM = DEP')
+        assert_equal(a, c, f'{year} {metric}: COM = REG')
     for category, (prefix, _) in CATEGORIES.items():
-        total = float(num_col(totals.loc[totals["categorie"].eq(category)],
-                              "nuites").iloc[0])
-        ensure_close(out.loc[out.admin_level.eq("COM"), prefix+"_year"].sum(),
-                     total, f"total source {year}/{category}")
-    for key, value in META.items():
-        out[key] = value
-    out["annee"] = year
-    out["source_totaux"] = "DS_SUIVI_DDE_TOUR_TRAVEL_DEST__T"
-    out["annee_reference_population"] = (
-        keys["annee_reference_population"].dropna().iloc[0]
-        if "annee_reference_population" in keys else "")
-    out["annee_reference_logements"] = (
-        keys["annee_reference_logements"].dropna().iloc[0]
-        if "annee_reference_logements" in keys else "")
+        assert_equal(result.loc[result.admin_level.eq('COM'), prefix+'_year'].sum(),
+                     adjusted[category], f'{year} {prefix}: conservation de la source ajustée')
+        for level in ('COM', 'DEP', 'REG'):
+            slice_ = result[result.admin_level.eq(level)]
+            sum_months = slice_[[prefix + '_' + month for month in MONTHS]].sum(axis=1)
+            if not np.allclose(sum_months, slice_[prefix + '_year'], atol=0.01, rtol=0):
+                raise ValueError(f'[ECHEC SOMMES] {year} {level} {prefix}: 12 mois != annuel')
+    actual_levels = result.groupby('admin_level').size().to_dict()
+    if actual_levels.get('DEP') != 96 or actual_levels.get('REG') != 13:
+        raise ValueError(f'Nombre de DEP/REG incorrect : {actual_levels}')
 
-    dest = path(year, "scenario_non_marchand_com_dep_reg_{year}.csv")
-    out.to_csv(dest, index=False, encoding="utf-8-sig", sep=";")
-    note = path(year, "scenario_non_marchand_hypotheses_{year}.txt")
-    note.write_text(
-        f"CAFÉ {year} — SCÉNARIO EXPLORATOIRE NON VALIDÉ\n\n"
-        "Origine : INSEE DS_SUIVI_DDE_TOUR, TRAVEL_DEST=_T = toutes destinations.\n"
-        "Les nuitées ne sont PAS des totaux de destinations métropolitaines.\n"
-        "Hypothèse géographique : affecter fictivement tous ces totaux aux\n"
-        "communes métropolitaines avec poids population/logements (scripts 49/50).\n"
-        "Hypothèse mensuelle : répartition UNIFORME 1/12 (aucun profil observé).\n"
-        "Chaque commune somme sur 12 mois à son total annuel scénarisé.\n"
-        "Départements et régions = somme des communes (sans doubles comptes).\n"
-        "NE PAS utiliser comme mesure officielle ni mélanger aux données validées.\n",
-        encoding="utf-8",
-    )
-    print(f"  [OK] {len(com):,} COM / 96 DEP / 13 REG")
-    print(f"  [OK] Conservation COM -> DEP -> REG")
-    print(f"  [SCÉNARIO] Mensualisation exploratoire uniforme 1/12")
-    print(f"  Export : {dest}")
+    result['annee'] = year
+    result['scenario'] = 'EXPLORATOIRE_NON_VALIDE'
+    result['hypothese_geographique'] = ('ratio_tous_hebergements_FRANCE_PLUS_OUTREMER_'
+                                        'applique_aux_categories_et_alloue_en_metropole')
+    result['hypothese_mensuelle'] = 'UNIFORME_1_SUR_12_NON_OBSERVEE'
+    result['perimetre_destination'] = 'FRANCE_PLUS_OUTREMER_PROXY_METROPOLE'
+    result['ratio_france_outremer'] = ratio
+    result['source_totaux'] = 'DS_SUIVI_DDE_TOUR_TRAVEL_DEST__T'
+    result['source_ratio'] = 'DS_SUIVI_DDE_TOUR_TRAVEL_DEST_250_sur__T'
+    for meta in ('annee_reference_population', 'statut_population',
+                 'annee_reference_logements', 'statut_logements'):
+        if meta in keys.columns:
+            values = keys[meta].dropna().unique()
+            result[meta] = values[0] if len(values) == 1 else ''
+
+    output = folder / f'scenario_non_marchand_com_dep_reg_{year}.csv'
+    output.parent.mkdir(parents=True, exist_ok=True)
+    result.to_csv(output, sep=';', index=False, encoding='utf-8-sig')
+    notes = folder / f'scenario_non_marchand_hypotheses_{year}.txt'
+    notes.write_text(
+        f'CAFÉ {year} — SCÉNARIO B EXPLORATOIRE NON VALIDÉ\n'
+        f'Ratio de destination : France + outre-mer = {domestic:.0f}; toutes destinations = {all_dest:.0f}; coefficient = {ratio:.9f}.\n'
+        'Hypothèse : appliquer le ratio global tous hébergements aux deux types non marchands.\n'
+        'Limite : France + outre-mer N’EST PAS la France métropolitaine.\n'
+        'Allocation fictive des nuitées ajustées vers les communes métropolitaines selon les clés 49/50.\n'
+        'Mensualisation uniforme 1/12 sans observation saisonnière.\n'
+        'Contrôles intégrés : 12 mois = année ; COM = DEP = REG ; totaux = source × ratio.\n'
+        'Ne pas qualifier ces chiffres de données INSEE communales observées.\n',
+        encoding='utf-8')
+    print(f'  [OK] SOMMES : COM = DEP = REG ; somme 12 mois = annuel ; {actual_levels}')
+    print(f'  [OK] Export : {output}')
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--year", type=int, choices=YEARS)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--year', type=int, choices=YEARS, help='Une année (défaut : toutes)')
     args = parser.parse_args()
-    for year in ([args.year] if args.year else YEARS):
-        effectuer(year)
+    ratios = destination_ratios()
+    for year in ((args.year,) if args.year else YEARS):
+        perform(year, ratios)
+    print('\n=== SCÉNARIO B : 2022-2025 TERMINÉ (NON VALIDÉ GÉOGRAPHIQUEMENT) ===')
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
